@@ -47,6 +47,7 @@ class RolloutController:
                 RolloutWorker actors.
         """
         self.config = infer_config
+        self._turn_instances: set[str] | None = None
         self.num_gpus_per_engine = self.config.num_gpus_per_engine
         self.logger = get_logger(log_dir=infer_config.worker_log_dir, tag="RolloutController")
         self.registry = self._init_workers(placement_group)
@@ -121,14 +122,30 @@ class RolloutController:
         )
         self.proxy_manager.replace_registered_session_urls(session_urls)
 
-    def validate_registered_workers_to_proxy(self) -> None:
+    async def validate_registered_workers_to_proxy(self) -> None:
         if self.proxy_manager is None:
             return
-        self.proxy_manager.validate_registered_session_urls()
+        if not self.config.turn_level_async:
+            return await asyncio.to_thread(self.proxy_manager.validate_registered_session_urls)
+        # The startup probe runs only after initial weights are ready. It obeys
+        # the same barrier and owns a disposable trace session.
+        from .trace_store import release_existing_sessions
+        session_id = "startup-probe-" + uuid4().hex
+        await self.turn_control("prepare_version", version=0, source_optimizer_step=0, epoch=0)
+        await self.turn_control("open_admission", version=0, source_optimizer_step=0, epoch=0)
+        try:
+            await asyncio.to_thread(self.proxy_manager.validate_registered_session_urls, session_id)
+        finally:
+            await self.turn_control("close_admission", epoch=0)
+            await self.turn_control("cancel_session", session_id=session_id, reason="probe_complete")
+            await self.turn_control("drain", timeout=60)
+            await release_existing_sessions([session_id])
 
     @trace_rollout_endpoint("rollout.controller.generate")
     @ray.method(concurrency_group=ROLLOUT_CONCURRENCY_GROUP_GENERATE)
     async def generate(self, rollout_state: RolloutState) -> RolloutState:
+        if self.config.turn_level_async:
+            raise RuntimeError("turn-level agentic generation must use the traced SessionServer")
         if XTUNER_DETERMINISTIC:
             sample_params = rollout_state.sample_params.model_copy(deep=True)
             sample_params.sampling_seed = self.config.random_seed + (
@@ -198,6 +215,38 @@ class RolloutController:
         if failed_worker_urls:
             self.logger.warning(f"Abort request failed: worker_urls={failed_worker_urls}")
 
+    async def turn_control(self, action: str, **kwargs):
+        """Broadcast turn barriers without using the legacy abort-all pause."""
+        if action == "close_admission":
+            self.health_manager.pause()
+            if not await asyncio.to_thread(self.health_manager.wait_recovery_done, timeout=60.0):
+                raise TimeoutError("worker recovery did not settle before closing admission")
+        workers = self.registry.active_workers()
+        cleanup_action = action in {"close_admission", "cancel_session", "drain", "shutdown"}
+        if not cleanup_action and len(workers) != len(self.registry.all_workers()):
+            raise RuntimeError("turn-level worker failure requires stopping this run; recovery is not yet validated")
+        async def broadcast(operation, arguments):
+            replies = await asyncio.gather(*[
+                worker.actor.turn_control.remote(operation, **arguments) for worker in workers])
+            replies = [reply for reply in replies if reply is not None]
+            if not replies:
+                raise RuntimeError("no turn-level inference entrypoints")
+            return replies
+
+        if not cleanup_action:
+            statuses = await broadcast("status", {})
+            instances = {reply["instance_id"] for reply in statuses}
+            if self._turn_instances is None:
+                self._turn_instances = instances
+            elif instances != self._turn_instances:
+                raise RuntimeError("turn-level entrypoint was replaced; refusing unverified version recovery")
+            if action == "status":
+                return statuses
+        replies = await broadcast(action, kwargs)
+        if action == "open_admission":
+            self.health_manager.resume()
+        return replies
+
     async def shutdown_inactive_workers(self):
         """Shut down failed groups so training can reuse shared rollout
         resources."""
@@ -240,7 +289,8 @@ class RolloutController:
 
     def continue_generation(self):
         self._broadcast_to_workers("continue_generation", WorkerLifecycleState.ACTIVE)
-        self.health_manager.resume()
+        if not self.config.turn_level_async:
+            self.health_manager.resume()
 
     def offload(self):
         self._broadcast_to_workers("offload", WorkerLifecycleState.ACTIVE)

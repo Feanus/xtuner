@@ -1,5 +1,11 @@
 import copy
+import asyncio
+import contextvars
 import json
+import os
+import time
+from pathlib import Path
+from uuid import uuid4
 from functools import reduce
 from http import HTTPStatus
 from operator import add
@@ -14,13 +20,33 @@ from xtuner.v1.utils import get_logger
 
 from .chat_template import canonicalize_messages_for_chat_template
 from .trace_store import TokenizedSegment, get_store
+from .turn_gate import TurnCancelled, TurnGate
+
+
+_turn_context = contextvars.ContextVar("turn_context", default=None)
+
+
+def _turn_event(event: str, ticket, **fields):
+    root = os.environ.get("WORK_DIR")
+    if root:
+        path = Path(root) / "turn_requests.jsonl"
+        payload = {"event": event, "time": time.time(), "request_id": ticket.request_id,
+                   "session_id": ticket.session_id, "version": ticket.version,
+                   "source_optimizer_step": ticket.source_optimizer_step,
+                   "epoch": ticket.barrier_epoch, **fields}
+        # One append syscall per small event, shared by the replica actors.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, (json.dumps(payload) + "\n").encode())
+        finally:
+            os.close(fd)
 
 
 FMT_OPENAI = "openai"
 FMT_ANTHROPIC = "anthropic"
 
 # Fields the SessionServer consumes locally and never forwards upstream.
-_SESSION_SERVER_ONLY_KEYS = {"session_id"}
+_SESSION_SERVER_ONLY_KEYS = {"session_id", "xtuner_route_ack"}
 
 
 def _normalize_path(req_path: str) -> str:
@@ -276,6 +302,8 @@ class SessionServer:
         request_timeout: float = 1200.0,
         read_bufsize: int = 2**26,
         enable_return_routed_experts: bool = False,
+        turn_level_async: bool = False,
+        turn_max_active: int = 16,
     ):
         self.worker_base_url = worker_base_url.rstrip("/")
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
@@ -291,6 +319,37 @@ class SessionServer:
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
         self._lmdeploy_actor: Optional[ray.actor.ActorHandle] = None
+        self.turn_gate = TurnGate(max_active=turn_max_active) if turn_level_async else None
+
+    async def cancel_turn_session(self, session_id: str, reason: str) -> dict:
+        await self.store.cancel_turn_session.remote(session_id, reason)
+        tickets = await self.turn_gate.cancel_session(session_id, reason)
+        for ticket in tickets:
+            await self._abort_turn(ticket["engine_session_id"])
+        return self.turn_gate.status()
+
+    async def _abort_turn(self, engine_session_id: int) -> None:
+        async with ClientSession(timeout=ClientTimeout(total=30)) as client:
+            async with client.post(self.worker_base_url + "/abort_request",
+                                   json={"session_id": engine_session_id, "abort_all": False,
+                                         "wait_for_completion": True}) as resp:
+                # A completed request may already have left the engine registry.
+                if resp.status not in (200, 400):
+                    resp.raise_for_status()
+
+    async def drain_turns(self, timeout: float) -> dict:
+        async with asyncio.timeout(timeout):
+            await self.turn_gate.drain(timeout)
+            async with ClientSession(timeout=ClientTimeout(total=10)) as client:
+                while True:
+                    async with client.get(self.worker_base_url + "/generation_status") as resp:
+                        resp.raise_for_status()
+                        engine = await resp.json()
+                    if not engine["alive"]:
+                        raise RuntimeError("rollout engine died while draining")
+                    if engine["idle"]:
+                        return {**self.turn_gate.status(), "engine": engine}
+                    await asyncio.sleep(0.2)
 
     async def on_request(self, req_body: dict, fmt: str, *, trace_enabled: bool = True) -> dict:
         """Normalize the request to drive the prefix cache + inject extension
@@ -366,6 +425,12 @@ class SessionServer:
         delta = prompt_text[len(prefix) :]
         delta_ids = self.tokenizer.encode(delta, add_special_tokens=False) if delta else []
         input_ids = reduce(add, [node.value.token_ids for node in nodes] + [delta_ids])
+        context = _turn_context.get()
+        if context is not None:
+            context.update(prompt_key=prompt_text, prefix_segments=[n.value for n in nodes],
+                           delta_ids=delta_ids, delta_text=delta, input_ids=input_ids)
+            await self.store.reserve_turn.remote(context["ticket"].request_id,
+                int(os.environ.get("CYBERGYM_ROUTE_RESERVATION_BYTES", str(1024**3))))
 
         # 3. Inject extension fields on the forwarded request. The body still
         #    follows ``fmt``'s native schema. ``logprobs``/``top_logprobs`` are
@@ -379,6 +444,8 @@ class SessionServer:
         worker_req["return_routed_experts"] = True
         worker_req["return_logprob"] = True
         worker_req["include_stop_str_in_output"] = True
+        if context is not None:
+            worker_req["session_id"] = context["ticket"].engine_session_id
 
         if fmt == FMT_ANTHROPIC:
             # Raw tokens replace message rendering. Retain the tool schema
@@ -458,6 +525,49 @@ class SessionServer:
         ).rstrip()
         assert new_prompt.startswith(old_prompt) and new_prompt.endswith(self.stop_word)
 
+        context = _turn_context.get()
+        if context is not None:
+            ticket = context["ticket"]
+            if ticket.cancel_reason:
+                raise TurnCancelled(ticket.cancel_reason)
+            if old_prompt != context["prompt_key"]:
+                raise ValueError("response prompt differs from admitted input")
+            full_experts = None
+            routing_bytes = 0
+            if raw_routed_expert is not None:
+                experts = await self._decode_routed_experts(raw_routed_expert)
+                expected = len(context["input_ids"]) + len(output_token_ids) - 1
+                if len(experts) != expected:
+                    raise ValueError(f"full turn routing rows {len(experts)} != {expected}")
+                # Existing agentic training drops this one leading placeholder.
+                experts = np.concatenate([np.zeros_like(experts[:1]), experts], axis=0)
+                full_experts = ray.put(experts)
+                routing_bytes = experts.nbytes
+            elif self.enable_return_routed_experts:
+                raise ValueError("turn-level MoE response omitted full routing")
+            delta = (TokenizedSegment(text=context["delta_text"], token_ids=context["delta_ids"])
+                     if context["delta_ids"] else None)
+            response = TokenizedSegment(text=new_prompt[len(old_prompt):], token_ids=output_token_ids,
+                                        labels=output_token_ids, logprobs=output_logprobs,
+                                        model_step=ticket.source_optimizer_step, policy_version=ticket.version,
+                                        request_id=ticket.request_id)
+            ticket.phase = "committing"
+            try:
+                await self.store.commit_turn.remote(
+                    session_id, old_prompt, new_prompt, context["prefix_segments"], delta, response,
+                    [full_experts], {"request_id": ticket.request_id, "version": ticket.version,
+                                   "source_optimizer_step": ticket.source_optimizer_step,
+                                   "routing_bytes": routing_bytes},
+                )
+            except BaseException:
+                if full_experts is not None:
+                    ray.internal.free([full_experts], local_only=False)
+                raise
+            ticket.trace_committed = True
+            _turn_event("trace_committed", ticket, prompt_tokens=len(context["input_ids"]),
+                        generated_tokens=len(output_token_ids), routing_bytes=routing_bytes)
+            return worker_resp
+
         # Re-derive the input delta the worker processed. on_request no longer
         # persists it (that would leave a None-expert placeholder in the store),
         # so recompute it from the current prefix and split the routed experts
@@ -525,7 +635,8 @@ class SessionServer:
         if self._site is not None:
             return
 
-        self._app = web.Application()
+        # A 256K conversation can exceed aiohttp's default 1 MiB body limit.
+        self._app = web.Application(client_max_size=16 * 1024**2)
         self._app.router.add_route("*", "/{path:.*}", self._handle_request)
 
         self._runner = web.AppRunner(self._app)
@@ -544,6 +655,101 @@ class SessionServer:
         get_logger().info("SessionServer stopped.")
 
     async def _handle_request(self, request: web.Request) -> web.Response:
+        if getattr(self, "turn_gate", None) is None:
+            return await self._handle_request_core(request)
+        path = request.match_info["path"]
+        if not _is_generation_endpoint(request.method, path):
+            return await self._handle_turn_request(request)
+        try:
+            body = await request.json()
+            session_id = str(body["session_id"])
+        except (ValueError, KeyError, TypeError):
+            return await self._handle_turn_request(request)
+        # Requests from one logical session may land on different HTTP
+        # entrypoints. Serialize before prefix lookup using the shared store.
+        owner = uuid4().hex
+        try:
+            while True:
+                if request.transport is None or request.transport.is_closing():
+                    raise TurnCancelled("client_disconnected_before_admission")
+                claim = await self.store.claim_turn_session.remote(session_id, owner)
+                if claim["cancel_reason"]:
+                    raise TurnCancelled(claim["cancel_reason"])
+                if claim["acquired"]:
+                    break
+                await asyncio.sleep(0.2)
+            ack = body.get("xtuner_route_ack")
+            if ack is not None:
+                await self.store.acknowledge_turn_routes.remote(session_id, ack)
+            return await self._handle_turn_request(request)
+        except TurnCancelled as exc:
+            return web.json_response(_error_payload(_detect_format(path), str(exc), error_type="trial_cancelled"), status=409)
+        finally:
+            await self.store.release_turn_session.remote(session_id, owner)
+
+    async def _handle_turn_request(self, request: web.Request) -> web.Response:
+        gate = getattr(self, "turn_gate", None)
+        if gate is None:
+            return await self._handle_request_core(request)
+        path = request.match_info["path"]
+        fmt = _detect_format(path)
+        if not _is_generation_endpoint(request.method, path):
+            if request.method == "POST":
+                return web.json_response(_error_payload(fmt, "unsupported generation entry in turn mode"), status=400)
+            return await self._handle_request_core(request)
+        try:
+            body = await request.json()
+            session_id = str(body["session_id"])
+            if body.get("stream") or not _request_uses_trace_store(body):
+                raise ValueError("turn-level training requires non-streaming traced requests")
+        except (ValueError, KeyError, TypeError) as exc:
+            return web.json_response(_error_payload(fmt, str(exc)), status=400)
+        disconnected = lambda: request.transport is None or request.transport.is_closing()
+        try:
+            min_version = (await self.store.smoke_required_version.remote(session_id)
+                           if os.environ.get("CYBERGYM_SMOKE_CROSS_VERSION_TRIAL") else -1)
+            async with gate.admit(session_id, disconnected, min_version=min_version) as ticket:
+                _turn_event("admitted", ticket, wait_seconds=ticket.admitted_at - ticket.enqueued_at)
+                token = _turn_context.set({"ticket": ticket})
+                async def watch_disconnect():
+                    while True:
+                        await asyncio.sleep(0.5)
+                        if disconnected():
+                            await self.cancel_turn_session(session_id, "client_disconnected")
+                            return
+                watcher = asyncio.create_task(watch_disconnect())
+                try:
+                    result = await self._handle_request_core(request)
+                    if ticket.cancel_reason:
+                        raise TurnCancelled(ticket.cancel_reason)
+                    if result.status < 400 and not ticket.trace_committed:
+                        raise RuntimeError("successful turn response did not commit its trace")
+                    if result.status >= 400:
+                        await self.cancel_turn_session(session_id, "generation_or_trace_failed")
+                        raise TurnCancelled("generation_or_trace_failed")
+                    result.headers["X-XTuner-Request-ID"] = ticket.request_id
+                    result.headers["X-XTuner-Model-Step"] = str(ticket.source_optimizer_step)
+                    # Routed proxies may drop custom response headers. Keep the
+                    # identity in the JSON response as well as the HTTP header.
+                    body = json.loads(result.body)
+                    body["id"] = "xtuner-" + ticket.request_id
+                    body["xtuner_route_pruning"] = True
+                    result.body = json.dumps(body).encode()
+                    return result
+                except BaseException:
+                    await self._abort_turn(ticket.engine_session_id)
+                    raise
+                finally:
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
+                    _turn_context.reset(token)
+                    await self.store.release_turn_reservation.remote(ticket.request_id)
+                    _turn_event("finished", ticket, trace_committed=ticket.trace_committed,
+                                cancel_reason=ticket.cancel_reason)
+        except TurnCancelled as exc:
+            return web.json_response(_error_payload(fmt, str(exc), error_type="trial_cancelled"), status=409)
+
+    async def _handle_request_core(self, request: web.Request) -> web.Response:
         """Proxy handler: detect format, run hooks, forward, stream back."""
 
         req_path = request.match_info["path"]
@@ -1116,6 +1322,8 @@ class SessionServerActor:
         port: int,
         request_timeout: float,
         enable_return_routed_experts: bool = False,
+        turn_level_async: bool = False,
+        turn_max_active: int = 16,
     ):
         self.worker_base_url = worker_base_url
         self.tokenizer_path = tokenizer_path
@@ -1123,6 +1331,8 @@ class SessionServerActor:
         self.port = port
         self.request_timeout = request_timeout
         self.enable_return_routed_experts = enable_return_routed_experts
+        self.turn_level_async = turn_level_async
+        self.turn_max_active = turn_max_active
         self.server: SessionServer | None = None
 
     @property
@@ -1140,6 +1350,8 @@ class SessionServerActor:
             port=self.port,
             request_timeout=self.request_timeout,
             enable_return_routed_experts=self.enable_return_routed_experts,
+            turn_level_async=self.turn_level_async,
+            turn_max_active=self.turn_max_active,
         )
         await self.server.start()
         return self.server.url
@@ -1148,3 +1360,17 @@ class SessionServerActor:
         if self.server is not None:
             await self.server.stop()
             self.server = None
+
+    async def turn_control(self, action: str, **kwargs):
+        if self.server is None or self.server.turn_gate is None:
+            raise RuntimeError("turn-level server is not enabled")
+        gate = self.server.turn_gate
+        if action == "status":
+            return gate.status()
+        if action == "cancel_session":
+            return await self.server.cancel_turn_session(**kwargs)
+        if action == "drain":
+            return await self.server.drain_turns(**kwargs)
+        if action not in {"close_admission", "prepare_version", "open_admission", "drain", "shutdown"}:
+            raise ValueError(action)
+        return await getattr(gate, action)(**kwargs)

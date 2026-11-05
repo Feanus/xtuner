@@ -292,7 +292,7 @@ def _post(url: str, payload: dict) -> dict:
         return json.loads(resp.read())
 
 
-def check_chat_completions(base_url: str, model: str) -> bool:
+def check_chat_completions(base_url: str, model: str, session_id: str | None = None) -> bool:
     normalized_base_url = base_url.rstrip("/")
     if normalized_base_url.endswith("/v1"):
         url = f"{normalized_base_url}/chat/completions"
@@ -300,7 +300,7 @@ def check_chat_completions(base_url: str, model: str) -> bool:
         url = f"{normalized_base_url}/v1/chat/completions"
     payload = {
         "model": model,
-        "session_id": str(uuid.uuid4()),
+        "session_id": session_id or str(uuid.uuid4()),
         "messages": [{"role": "user", "content": "Reply with exactly: pong"}],
         "max_tokens": 16,
         "temperature": 0.0,

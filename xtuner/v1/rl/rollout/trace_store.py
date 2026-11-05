@@ -1,4 +1,5 @@
 import time
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -104,6 +105,9 @@ class TokenizedSegment(BaseModel):
     logprobs: List[float] | None = Field(default=None, repr=False)
     expert_key: Any = Field(default=None, repr=False)
     length: int | None = None
+    model_step: int | None = None
+    policy_version: int | None = None
+    request_id: str | None = None
 
     def model_post_init(self, _):
         if self.labels is None:
@@ -269,6 +273,143 @@ class RolloutTraceStore:
         self.sessions: Dict[str, Trie] = {}
         self.objects: Dict[str, ray.ObjectRef] = {}
         self.updated_at: Dict[str, float] = {}
+        # Full routing belongs to an endpoint request, not to the reused text
+        # nodes. The nodes keep the original generation probabilities/versions.
+        self.turn_traces: dict[str, dict[str, dict]] = {}
+        self.turn_reservations: dict[str, int] = {}
+        self.smoke_held_sessions: set[str] = set()
+        self.turn_owners: dict[str, str] = {}
+        self.cancelled_turn_sessions: dict[str, str] = {}
+        self.turn_byte_limit = int(os.environ.get("CYBERGYM_TRACE_HARD_BYTES", str(128 * 1024**3)))
+
+    def reserve_turn(self, request_id: str, byte_count: int):
+        memory = self.turn_memory()
+        if memory["routing_bytes"] + memory["reserved_bytes"] + byte_count > self.turn_byte_limit:
+            raise MemoryError("turn routing storage budget reached")
+        self.turn_reservations[request_id] = byte_count
+
+    def claim_turn_session(self, session_id: str, owner: str):
+        reason = self.cancelled_turn_sessions.get(session_id)
+        if reason:
+            return {"acquired": False, "cancel_reason": reason}
+        current = self.turn_owners.setdefault(session_id, owner)
+        return {"acquired": current == owner, "cancel_reason": None}
+
+    def release_turn_session(self, session_id: str, owner: str):
+        if self.turn_owners.get(session_id) == owner:
+            del self.turn_owners[session_id]
+
+    def cancel_turn_session(self, session_id: str, reason: str):
+        self.cancelled_turn_sessions[session_id] = reason
+
+    def smoke_hold_session(self, session_id: str):
+        self.smoke_held_sessions.add(session_id)
+
+    def smoke_required_version(self, session_id: str):
+        if session_id not in self.smoke_held_sessions:
+            return -1
+        versions = [r["version"] for k, r in self.turn_traces.get(session_id, {}).items()
+                    if not k.startswith("key:")]
+        return min(max(versions, default=-1) + 1, 2)
+
+    def oldest_session_versions(self, session_ids: list[str]) -> dict[str, int]:
+        """Conservative live-Trial bound before harness endpoint selection."""
+        result = {}
+        for session_id in session_ids:
+            versions = [record["version"] for key, record in self.turn_traces.get(session_id, {}).items()
+                        if not key.startswith("key:")]
+            if versions:
+                result[session_id] = min(versions)
+        return result
+
+    def release_turn_reservation(self, request_id: str):
+        self.turn_reservations.pop(request_id, None)
+
+    def commit_turn(self, session_id: str, prompt_key: str, key: str,
+                    prefix_segments: list[TokenizedSegment], delta: TokenizedSegment | None,
+                    response: TokenizedSegment, routed_experts: Any, metadata: dict) -> None:
+        # Keep ObjectRefs nested in RPC arguments: Ray dereferences top-level
+        # ObjectRefs before calling an actor method.
+        routed_experts = routed_experts[0]
+        segments = [*prefix_segments, *([delta] if delta is not None else []), response]
+        if any(s.model_step is None and any(t != -100 for t in s.labels) for s in segments):
+            raise ValueError("trainable turn tokens must have a generation version")
+        record = {"segments": segments, "key": key, "routed_experts": routed_experts, **metadata}
+        records = self.turn_traces.setdefault(session_id, {})
+        # Keep request identity even if two calls rendered exactly the same key.
+        request_key = metadata["request_id"]
+        reserved = self.turn_reservations.get(request_key)
+        if reserved is not None and metadata.get("routing_bytes", 0) > reserved:
+            raise MemoryError("full routing exceeded its request reservation")
+        if request_key in records:
+            raise ValueError("duplicate turn request commit")
+        trie = self.get_or_create(session_id)
+        if delta is not None:
+            trie.insert(prompt_key, delta)
+        trie.insert(key, response)
+        records[request_key] = record
+        records["key:" + key] = record
+        self.release_turn_reservation(request_key)
+
+    def turn_memory(self) -> dict:
+        records = [r for turns in self.turn_traces.values() for k, r in turns.items() if not k.startswith("key:")]
+        return {"sessions": len(self.turn_traces), "requests": len(records),
+                "routing_bytes": sum(r.get("routing_bytes", 0) for r in records),
+                "reserved_bytes": sum(self.turn_reservations.values()), "hard_limit": self.turn_byte_limit}
+
+    def acknowledge_turn_routes(self, session_id: str, ack: dict) -> dict:
+        """Release superseded routes after the recorder confirms receipt.
+
+        Called under the cross-replica session owner, before admitting the next
+        turn. Unknown/unacknowledged responses and exported consumers survive.
+        Token segments, logprobs and policy versions are never pruned here.
+        """
+        if not isinstance(ack, dict):
+            raise ValueError("invalid route acknowledgement")
+        observed, retained = ack.get("observed"), ack.get("retained")
+        if (not isinstance(observed, list) or not isinstance(retained, list)
+                or not observed or not retained
+                or any(not isinstance(x, str) or not x or x.startswith("key:")
+                       for x in observed + retained)):
+            raise ValueError("invalid route acknowledgement IDs")
+        observed, retained = set(observed), set(retained)
+        records = self.turn_traces.get(session_id, {})
+        if not retained <= observed or any(x not in records for x in observed):
+            raise ValueError("route acknowledgement does not match session records")
+        if any(records[x].get("routing_released") for x in retained):
+            # A concurrently issued request may carry an older recorder snapshot.
+            # Its already-superseded endpoints must not resurrect or free routes.
+            return {"released_routes": 0, "released_bytes": 0}
+        unused = [records[x] for x in observed - retained
+                  if records[x]["routed_experts"] is not None and not records[x].get("exported")]
+        freed_bytes = sum(r.get("routing_bytes", 0) for r in unused)
+        if unused:
+            ray.internal.free([r["routed_experts"] for r in unused], local_only=False)
+        for record in unused:
+            record["routed_experts"] = None
+            record["routing_bytes"] = 0
+            record["routing_released"] = True
+        return {"released_routes": len(unused), "released_bytes": freed_bytes}
+
+    def retain_turn_routes(self, session_id: str, request_ids: list[str]):
+        """After a Trial ends, keep only routes selected for training.
+
+        Token/logprob/version snapshots remain available. No live Trial may
+        call this: its harness has not yet frozen the selected endpoints.
+        """
+        records = self.turn_traces[session_id]
+        selected = set(request_ids)
+        if not selected or any(key not in records for key in selected):
+            raise ValueError("selected training request has no turn record")
+        unused = [record for key, record in records.items()
+                  if not key.startswith("key:") and key not in selected
+                  and record["routed_experts"] is not None]
+        if unused:
+            ray.internal.free([record["routed_experts"] for record in unused], local_only=False)
+        for record in unused:
+            record["routed_experts"] = None
+            record["routing_bytes"] = 0
+            record["routing_released"] = True
 
     def get_or_create(self, session_id: str) -> Trie:
         """Get the Trie for a session, or create one if it doesn't exist.
@@ -322,7 +463,20 @@ class RolloutTraceStore:
             Tuple[str, List["TreeNode"]]: The matched prefix and matched nodes.
         """
         trie = self.get_or_create(session_id)
-        return trie.search(text, filter_none)
+        prefix, nodes = trie.search(text, filter_none)
+        records = self.turn_traces.get(session_id)
+        if records:
+            # Repeated text may replace an ancestor Trie value. A descendant's
+            # original token provenance is its committed snapshot, not today's
+            # mutable ancestor values.
+            for index in range(len(nodes) - 1, -1, -1):
+                value = nodes[index].value
+                request_id = getattr(value, "request_id", None)
+                if request_id in records:
+                    segments = records[request_id]["segments"]
+                    nodes = [TreeNode(value=s, parent=None) for s in segments] + nodes[index + 1:]
+                    break
+        return prefix, nodes
 
     def release(self, session_id: str, key: str | None = None):
         """Release Trie nodes and free associated resources for a session.
@@ -335,6 +489,13 @@ class RolloutTraceStore:
         assert session_id in self.sessions, f"Session ID '{session_id}' not found for release."
         trie = self.sessions.pop(session_id) if key is None else self.sessions[session_id]
         trie.release(key)
+        if key is None:
+            records = self.turn_traces.pop(session_id, {})
+            self.smoke_held_sessions.discard(session_id)
+            refs = [record["routed_experts"] for name, record in records.items()
+                    if not name.startswith("key:") and record["routed_experts"] is not None]
+            if refs:
+                ray.internal.free(refs, local_only=False)
 
     def release_sessions(self, session_ids: list[str]) -> list[str]:
         """Release existing trace sessions in one actor call.
@@ -359,7 +520,7 @@ class RolloutTraceStore:
         self.objects.clear()
         self.updated_at.clear()
 
-    def export_training_trace(self, session_id: str, prompt_text: str) -> dict:
+    def export_training_trace(self, session_id: str, prompt_text: str, request_id: str | None = None) -> dict:
         """Export the stored training trace given a complete prompt text.
 
         Args:
@@ -375,6 +536,27 @@ class RolloutTraceStore:
         Raises:
             ValueError: If the prompt_text does not completely match the trace keys in the session.
         """
+        turns = self.turn_traces.get(session_id)
+        if turns is not None:
+            record = turns.get(request_id if request_id is not None else "key:" + prompt_text)
+            if record is None:
+                raise ValueError("selected turn endpoint has no complete routing record")
+            if record["key"] != prompt_text:
+                raise ValueError("selected request identity does not match its rendered endpoint")
+            if record.get("routing_released"):
+                raise ValueError("routing for this unselected terminal endpoint was released")
+            trace = {"input_ids": [], "labels": [], "logprobs": [], "model_steps": [], "policy_versions": []}
+            for segment in record["segments"]:
+                trace["input_ids"].extend(segment.token_ids)
+                trace["labels"].extend(segment.labels)
+                trace["logprobs"].extend(segment.logprobs)
+                trace["model_steps"].extend([segment.model_step] * len(segment.token_ids))
+                trace["policy_versions"].extend([segment.policy_version] * len(segment.token_ids))
+            trace["routed_experts"] = [record["routed_experts"]] if record["routed_experts"] is not None else None
+            trace["routing_source_request_id"] = record["request_id"]
+            trace["routing_source_version"] = record["version"]
+            record["exported"] = True  # Pin until terminal session cleanup.
+            return trace
         trie = self.get_or_create(session_id)
         key, nodes = trie.search(prompt_text, filter_none=True)
         if prompt_text != key:

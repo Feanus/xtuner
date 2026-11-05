@@ -46,10 +46,10 @@ class RolloutProxyManager(RolloutWorkerLifecycleListener):
             f"session_urls={unique_session_urls}, proxy_result={register_result}"
         )
 
-    def validate_registered_session_urls(self) -> None:
+    def validate_registered_session_urls(self, session_id: str | None = None) -> None:
         if not self._registered_session_urls:
             return
-        self._validate_routed_proxy()
+        self._validate_routed_proxy(session_id)
 
     def on_worker_group_inactive(self, group: "WorkerGroup") -> None:
         """Remove inactive request entrypoints from routed API proxy."""
@@ -102,13 +102,13 @@ class RolloutProxyManager(RolloutWorkerLifecycleListener):
             raise ValueError("RolloutConfig.model_name must be set when enable_proxy=True.")
         return self._model_name
 
-    def _validate_routed_proxy(self) -> None:
+    def _validate_routed_proxy(self, session_id: str | None = None) -> None:
         model_name = self._get_model_name()
         self._logger.info(
             f"Validating routed API proxy chat completions: url={self._routed_proxy_url}, model={model_name}"
         )
         for attempt in range(1, self._CHECK_ATTEMPTS + 1):
-            if check_chat_completions(self._routed_proxy_url, model_name):
+            if check_chat_completions(self._routed_proxy_url, model_name, session_id=session_id):
                 return
             if attempt < self._CHECK_ATTEMPTS:
                 self._logger.warning(

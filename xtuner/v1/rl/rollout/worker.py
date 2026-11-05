@@ -332,6 +332,8 @@ class RolloutConfig(BaseModel):
             help="Timeout duration (in seconds) for rollout requests.",
         ),
     ] = 1200.0
+    turn_level_async: bool = False
+    turn_max_active: int = 8
     session_server_timeout: Annotated[
         float,
         Parameter(
@@ -798,6 +800,8 @@ class RolloutWorker(SingleAcceleratorWorker):
                 port=self.session_server_port,
                 request_timeout=self.config.session_server_timeout,
                 enable_return_routed_experts=self.enable_return_routed_experts,
+                turn_level_async=self.config.turn_level_async,
+                turn_max_active=self.config.turn_max_active,
             )
         )
         self.session_server_url = ray.get(
@@ -822,6 +826,11 @@ class RolloutWorker(SingleAcceleratorWorker):
         """Pause the worker's generation process."""
         self.receive_abort_request.set()
         return await self._send_abort_request()
+
+    async def turn_control(self, action: str, **kwargs):
+        if self.session_server_actor is None:
+            return None
+        return await self.session_server_actor.turn_control.remote(action, **kwargs)
 
     async def _send_abort_request(self) -> bool:
         url = f"{self.server_url}/abort_request"

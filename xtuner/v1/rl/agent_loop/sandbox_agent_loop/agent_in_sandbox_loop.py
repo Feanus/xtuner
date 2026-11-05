@@ -316,6 +316,8 @@ class AgentInSandboxLoop(AgentLoop):
 
         rollout_states: list[RolloutState] = []
         trace_store = get_store()
+        endpoint_ids = [segment.get("request_id") for segment in item.artifacts["messages"]
+                        if _trim_to_last_assistant_turn(segment["messages"])]
         for segment_index, (messages, tools) in enumerate(segments):
             if not messages:
                 raise ValueError("Agent artifacts must contain at least one trainable messages trace.")
@@ -334,7 +336,12 @@ class AgentInSandboxLoop(AgentLoop):
                 add_generation_prompt=False,
             )
             prompt_text = text[:-1] if text.endswith("\n") else text
-            data = await trace_store.export_training_trace.remote(str(rollout_state.session_id), prompt_text)
+            endpoint_id = endpoint_ids[segment_index]
+            if endpoint_id is None:
+                data = await trace_store.export_training_trace.remote(str(rollout_state.session_id), prompt_text)
+            else:
+                data = await trace_store.export_training_trace.remote(
+                    str(rollout_state.session_id), prompt_text, request_id=endpoint_id)
             segment_state.input_ids = data["input_ids"]
             segment_state.labels = data["labels"]
             # Agentic training consumes input_ids/labels directly. response_ids is
@@ -343,6 +350,20 @@ class AgentInSandboxLoop(AgentLoop):
                 token_id for token_id, label in zip(data["input_ids"][1:], data["labels"][1:]) if label != -100
             ]
             segment_state.logprobs = data["logprobs"]
+            if "model_steps" in data:
+                segment_state.response_model_steps = [
+                    version for version, label in zip(data["model_steps"][1:], data["labels"][1:])
+                    if label != -100
+                ]
+                if any(version is None for version in segment_state.response_model_steps):
+                    raise ValueError("agentic response token is missing its generation version")
+                segment_state.extra_fields["routing_source_request_id"] = data["routing_source_request_id"]
+                segment_state.extra_fields["routing_source_version"] = data["routing_source_version"]
+                versions = [version for version, label in zip(data["policy_versions"][1:], data["labels"][1:])
+                            if label != -100]
+                if any(version is None for version in versions):
+                    raise ValueError("agentic response token is missing its published version")
+                segment_state.extra_fields["response_policy_versions"] = versions
             # ``routed_experts`` is a per-node list for a MoE trace or ``None`` for a dense one; trace_store's
             # ``_resolve_routed_experts`` already enforces the all-or-nothing invariant (a trace mixing MoE turns with
             # missing-expert turns raises there and the sample is dropped as FAILED), so we pass it through as-is.
