@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -31,6 +32,20 @@ def cgroup(root: Path) -> None:
 
 
 class TestMemoryGuard:
+    @pytest.fixture(autouse=True)
+    def simulated_manager(self, monkeypatch, tmp_path):
+        # These cases use a temporary fake cgroup filesystem, not host controls.
+        # Model the manager identity and owner while keeping real sandbox checks.
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        original = Path.stat
+        def manager_stat(path, *args, **kwargs):
+            value = original(path, *args, **kwargs)
+            fields = list(value)
+            if path == tmp_path or tmp_path in path.parents:
+                fields[4] = 0
+            return os.stat_result(fields)
+        monkeypatch.setattr(Path, "stat", manager_stat)
+
     def test_configurable_budget_and_cgroup_are_independent_of_recipe(self, tmp_path: Path) -> None:
         cgroup(tmp_path)
         report = tmp_path / "task-resources.json"
