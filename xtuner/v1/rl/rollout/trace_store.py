@@ -1,4 +1,8 @@
 import time
+import asyncio
+import gc
+from functools import wraps
+from uuid import uuid4
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +30,8 @@ def _free_ray_refs(obj: Any):
             ray.internal.free([obj], local_only=False)
         except Exception as e:
             get_logger().error(f"Failed to free Ray ObjectRef {obj}: {e}")
+    elif isinstance(obj, TokenizedSegment):
+        _free_ray_refs(obj.expert_key)
     elif isinstance(obj, dict):
         for v in obj.values():
             _free_ray_refs(v)
@@ -263,13 +269,61 @@ class Trie:
                 break
 
 
+@dataclass(frozen=True)
+class SegmentPath:
+    """Actor-local immutable history; never serialize parents across Ray."""
+    parent: "SegmentPath | None"
+    segment: TokenizedSegment
+
+
+def path_segments(path):
+    result = []
+    while path is not None:
+        result.append(path.segment)
+        path = path.parent
+    return reversed(result)
+
+
+def _trace_operation(method):
+    @wraps(method)
+    def measured(self, *args, **kwargs):
+        if not self._metrics_enabled:
+            return method(self, *args, **kwargs)
+        started = time.perf_counter()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            elapsed = time.perf_counter() - started
+            stat = self._operation_metrics.setdefault(method.__name__, {"calls": 0, "seconds": 0.0, "max_seconds": 0.0})
+            stat["calls"] += 1
+            stat["seconds"] += elapsed
+            stat["max_seconds"] = max(stat["max_seconds"], elapsed)
+    return measured
+
+
 @ray.remote(num_cpus=0)
 class RolloutTraceStore:
     """Actor for managing trace stores (Tries) across different rollout
     sessions."""
 
-    def __init__(self):
+    def __init__(self, byte_limit: int | None = None, topology: tuple[int, int] | None = None):
         """Initialize the rollout trace store actor."""
+        self._metrics_enabled = os.environ.get("CYBERGYM_TRACE_METRICS", "0") == "1"
+        self._operation_metrics = {}
+        self._gc_metrics = {"calls": 0, "seconds": 0.0, "max_seconds": 0.0}
+        if self._metrics_enabled:
+            gc_stat = self._gc_metrics
+            gc_started = {}
+            def record_gc(phase, info):
+                generation = info["generation"]
+                if phase == "start":
+                    gc_started[generation] = time.perf_counter()
+                elif generation in gc_started:
+                    duration = time.perf_counter() - gc_started.pop(generation)
+                    gc_stat["calls"] += 1
+                    gc_stat["seconds"] += duration
+                    gc_stat["max_seconds"] = max(gc_stat["max_seconds"], duration)
+            gc.callbacks.append(record_gc)
         self.sessions: Dict[str, Trie] = {}
         self.objects: Dict[str, ray.ObjectRef] = {}
         self.updated_at: Dict[str, float] = {}
@@ -277,19 +331,43 @@ class RolloutTraceStore:
         # nodes. The nodes keep the original generation probabilities/versions.
         self.turn_traces: dict[str, dict[str, dict]] = {}
         self.turn_reservations: dict[str, int] = {}
+        self.pending_prefixes = {}
+        self.session_pending = {}
+        self.session_epochs = {}
+        self.closed_sessions = set()
+        self.cleanup_jobs = {}
+        self._request_count = 0
+        self._routing_bytes = 0
+        self._reserved_bytes = 0
+        self._segment_count = 0
+        self._token_count = 0
+        self.session_segments = {}
         self.smoke_held_sessions: set[str] = set()
         self.turn_owners: dict[str, str] = {}
         self.cancelled_turn_sessions: dict[str, str] = {}
-        self.turn_byte_limit = int(os.environ.get("CYBERGYM_TRACE_HARD_BYTES", str(128 * 1024**3)))
+        total_limit = int(os.environ.get("CYBERGYM_TRACE_HARD_BYTES", str(128 * 1024**3)))
+        self.turn_byte_limit = total_limit if byte_limit is None else byte_limit
+        self._topology = topology or (1, total_limit)
 
-    def reserve_turn(self, request_id: str, byte_count: int):
+    def trace_topology(self):
+        return self._topology
+
+    def reserve_turn(self, request_id: str, byte_count: int, session_id: str | None = None):
+        if session_id is not None:
+            pending = self.pending_prefixes.get(request_id)
+            if (session_id in self.closed_sessions or session_id in self.cancelled_turn_sessions
+                    or pending is None or pending[0] != session_id):
+                raise ValueError("reservation has no active prepared turn")
+        if byte_count < 0:
+            raise ValueError("negative reservation")
         memory = self.turn_memory()
-        if memory["routing_bytes"] + memory["reserved_bytes"] + byte_count > self.turn_byte_limit:
+        if memory["routing_bytes"] + memory["reserved_bytes"] - self.turn_reservations.get(request_id, 0) + byte_count > self.turn_byte_limit:
             raise MemoryError("turn routing storage budget reached")
+        self._reserved_bytes += byte_count - self.turn_reservations.get(request_id, 0)
         self.turn_reservations[request_id] = byte_count
 
     def claim_turn_session(self, session_id: str, owner: str):
-        reason = self.cancelled_turn_sessions.get(session_id)
+        reason = "session_closed" if session_id in self.closed_sessions else self.cancelled_turn_sessions.get(session_id)
         if reason:
             return {"acquired": False, "cancel_reason": reason}
         current = self.turn_owners.setdefault(session_id, owner)
@@ -322,40 +400,131 @@ class RolloutTraceStore:
                 result[session_id] = min(versions)
         return result
 
-    def release_turn_reservation(self, request_id: str):
-        self.turn_reservations.pop(request_id, None)
+    def release_turn_reservation(self, request_id: str, session_id: str | None = None):
+        self._reserved_bytes -= self.turn_reservations.pop(request_id, 0)
+        pending = self.pending_prefixes.pop(request_id, None)
+        if pending is not None:
+            requests = self.session_pending.get(pending[0])
+            if requests is not None:
+                requests.discard(request_id)
+                if not requests:
+                    self.session_pending.pop(pending[0], None)
 
+    def _prefix_path(self, session_id, text):
+        trie = self.get_or_create(session_id)
+        prefix, nodes = trie.search(text, filter_none=True)
+        records = self.turn_traces.get(session_id, {})
+        path = None
+        start = 0
+        for index in range(len(nodes) - 1, -1, -1):
+            request_id = getattr(nodes[index].value, "request_id", None)
+            if request_id in records:
+                path = records[request_id]["path"]
+                start = index + 1
+                break
+        for node in nodes[start:]:
+            path = SegmentPath(path, node.value)
+        return prefix, path
+
+    @_trace_operation
+    def prepare_turn(self, session_id: str, prompt: str, request_id: str) -> dict:
+        """Return tokens and a request-scoped capability, never historical segments."""
+        if session_id in self.cancelled_turn_sessions:
+            raise ValueError("session cancelled")
+        if request_id in self.pending_prefixes or request_id in self.turn_traces.get(session_id, {}):
+            raise ValueError("duplicate turn request preparation")
+        prefix, path = self._prefix_path(session_id, prompt)
+        handle = uuid4().hex
+        self.pending_prefixes[request_id] = (session_id, self.session_epochs[session_id], handle, prompt, path, prefix)
+        self.session_pending.setdefault(session_id, set()).add(request_id)
+        return {"prefix": prefix, "input_ids": [token for seg in path_segments(path) for token in seg.token_ids],
+                "handle": {"request_id": request_id, "capability": handle}}
+
+    @_trace_operation
     def commit_turn(self, session_id: str, prompt_key: str, key: str,
-                    prefix_segments: list[TokenizedSegment], delta: TokenizedSegment | None,
+                    prefix_segments: list[TokenizedSegment] | dict, delta: TokenizedSegment | None,
                     response: TokenizedSegment, routed_experts: Any, metadata: dict) -> None:
-        # Keep ObjectRefs nested in RPC arguments: Ray dereferences top-level
-        # ObjectRefs before calling an actor method.
-        routed_experts = routed_experts[0]
-        segments = [*prefix_segments, *([delta] if delta is not None else []), response]
-        if any(s.model_step is None and any(t != -100 for t in s.labels) for s in segments):
-            raise ValueError("trainable turn tokens must have a generation version")
-        record = {"segments": segments, "key": key, "routed_experts": routed_experts, **metadata}
-        records = self.turn_traces.setdefault(session_id, {})
-        # Keep request identity even if two calls rendered exactly the same key.
+        # Lists support old direct callers; production uses request-scoped handles.
         request_key = metadata["request_id"]
-        reserved = self.turn_reservations.get(request_key)
-        if reserved is not None and metadata.get("routing_bytes", 0) > reserved:
-            raise MemoryError("full routing exceeded its request reservation")
+        if not isinstance(request_key, str) or not request_key or request_key.startswith("key:"):
+            raise ValueError("invalid turn request identity")
+        if session_id in self.closed_sessions or session_id in self.cancelled_turn_sessions:
+            raise ValueError("session closed or cancelled")
+        records = self.turn_traces.get(session_id, {})
         if request_key in records:
             raise ValueError("duplicate turn request commit")
+        additions = [*([delta] if delta is not None else []), response]
+        if any(seg.model_step is None and any(t != -100 for t in seg.labels) for seg in additions):
+            raise ValueError("trainable turn tokens must have a generation version")
+        if not key.startswith(prompt_key) or key != prompt_key + response.text:
+            raise ValueError("response endpoint does not match prompt")
+        routing_bytes = metadata.get("routing_bytes", 0)
+        reserved = self.turn_reservations.get(request_key)
+        if routing_bytes < 0 or (reserved is not None and routing_bytes > reserved):
+            raise MemoryError("full routing exceeded its request reservation")
+        if isinstance(prefix_segments, dict):
+            pending = self.pending_prefixes.get(request_key)
+            if (pending is None or pending[:2] != (session_id, self.session_epochs.get(session_id))
+                    or prefix_segments != {"request_id": request_key, "capability": pending[2]}
+                    or pending[3] != prompt_key):
+                raise ValueError("invalid or stale prefix handle")
+            path = pending[4]
+            prefix = pending[5]
+        else:
+            prefix, path = self._prefix_path(session_id, prompt_key)
+            if list(path_segments(path)) != prefix_segments:
+                raise ValueError("prefix segments differ from stored history")
+        if (delta.text if delta is not None else "") != prompt_key[len(prefix):]:
+            raise ValueError("delta does not match prepared prefix")
+        if response.request_id != request_key:
+            raise ValueError("response request identity mismatch")
+        # Own copies of the new data; the actor's historical segments are never mutated.
+        additions = [seg.model_copy(deep=True) for seg in additions]
+        for seg in additions:
+            path = SegmentPath(path, seg)
+        record = {**metadata, "path": path, "key": key, "routed_experts": routed_experts[0]}
         trie = self.get_or_create(session_id)
         if delta is not None:
-            trie.insert(prompt_key, delta)
-        trie.insert(key, response)
+            trie.insert(prompt_key, additions[0])
+        trie.insert(key, additions[-1])
+        records = self.turn_traces.setdefault(session_id, {})
         records[request_key] = record
         records["key:" + key] = record
+        owned = self.session_segments.setdefault(session_id, [])
+        owned.extend(additions)
+        self._segment_count += len(additions)
+        self._token_count += sum(len(seg.token_ids) for seg in additions)
+        self._request_count += 1
+        self._routing_bytes += routing_bytes
         self.release_turn_reservation(request_key)
 
+    @_trace_operation
     def turn_memory(self) -> dict:
+        return {"sessions": len(self.turn_traces), "requests": self._request_count,
+                "routing_bytes": self._routing_bytes, "reserved_bytes": self._reserved_bytes,
+                "hard_limit": self.turn_byte_limit, "segments": self._segment_count,
+                "tokens": self._token_count, "cleanup_sessions": len(self.cleanup_jobs)}
+
+    def trace_metrics(self) -> dict:
+        # Logical counters do not approximate Python object overhead.
+        rss = None
+        try:
+            with open("/proc/self/status") as status:
+                rss = next(int(line.split()[1]) * 1024 for line in status if line.startswith("VmRSS:"))
+        except (OSError, StopIteration):
+            pass
+        return {"operations": self._operation_metrics, "gc": self._gc_metrics,
+                "rss_bytes": rss, "logical": self.turn_memory()}
+
+    def audit_turn_memory(self) -> dict:
+        """Expensive independent counters for tests/diagnostics only."""
         records = [r for turns in self.turn_traces.values() for k, r in turns.items() if not k.startswith("key:")]
+        segments = [seg for values in self.session_segments.values() for seg in values]
         return {"sessions": len(self.turn_traces), "requests": len(records),
                 "routing_bytes": sum(r.get("routing_bytes", 0) for r in records),
-                "reserved_bytes": sum(self.turn_reservations.values()), "hard_limit": self.turn_byte_limit}
+                "reserved_bytes": sum(self.turn_reservations.values()), "hard_limit": self.turn_byte_limit,
+                "segments": len(segments), "tokens": sum(len(seg.token_ids) for seg in segments),
+                "cleanup_sessions": len(self.cleanup_jobs)}
 
     def acknowledge_turn_routes(self, session_id: str, ack: dict) -> dict:
         """Release superseded routes after the recorder confirms receipt.
@@ -386,6 +555,7 @@ class RolloutTraceStore:
         if unused:
             ray.internal.free([r["routed_experts"] for r in unused], local_only=False)
         for record in unused:
+            self._routing_bytes -= record.get("routing_bytes", 0)
             record["routed_experts"] = None
             record["routing_bytes"] = 0
             record["routing_released"] = True
@@ -407,6 +577,7 @@ class RolloutTraceStore:
         if unused:
             ray.internal.free([record["routed_experts"] for record in unused], local_only=False)
         for record in unused:
+            self._routing_bytes -= record.get("routing_bytes", 0)
             record["routed_experts"] = None
             record["routing_bytes"] = 0
             record["routing_released"] = True
@@ -420,8 +591,11 @@ class RolloutTraceStore:
         Returns:
             Trie: The Trie instance associated with the session.
         """
+        if session_id in self.closed_sessions:
+            raise ValueError("session closed")
         if session_id not in self.sessions:
             self.sessions[session_id] = Trie()
+            self.session_epochs[session_id] = uuid4().hex
         return self.sessions[session_id]
 
     def list_sessions(self) -> List[str]:
@@ -451,6 +625,7 @@ class RolloutTraceStore:
         trie = self.get_or_create(session_id)
         return trie.insert(key, value)
 
+    @_trace_operation
     def search(self, session_id: str, text: str, filter_none: bool = False):
         """Search the longest prefix in a session's Trie.
 
@@ -462,57 +637,100 @@ class RolloutTraceStore:
         Returns:
             Tuple[str, List["TreeNode"]]: The matched prefix and matched nodes.
         """
-        trie = self.get_or_create(session_id)
-        prefix, nodes = trie.search(text, filter_none)
-        records = self.turn_traces.get(session_id)
-        if records:
-            # Repeated text may replace an ancestor Trie value. A descendant's
-            # original token provenance is its committed snapshot, not today's
-            # mutable ancestor values.
-            for index in range(len(nodes) - 1, -1, -1):
-                value = nodes[index].value
-                request_id = getattr(value, "request_id", None)
-                if request_id in records:
-                    segments = records[request_id]["segments"]
-                    nodes = [TreeNode(value=s, parent=None) for s in segments] + nodes[index + 1:]
+        if not self.turn_traces.get(session_id):
+            return self.get_or_create(session_id).search(text, filter_none)
+        prefix, path = self._prefix_path(session_id, text)
+        return prefix, [TreeNode(value=seg, parent=None) for seg in path_segments(path)]
+
+    @_trace_operation
+    def begin_release_sessions(self, session_ids: list[str]) -> list[str]:
+        found = []
+        for sid in dict.fromkeys(session_ids):
+            if sid not in self.sessions:
+                continue
+            found.append(sid)
+            if sid in self.cleanup_jobs:
+                continue
+            self.closed_sessions.add(sid)
+            self.cleanup_jobs[sid] = {"stack": [self.sessions[sid].root]}
+            for request in list(self.session_pending.get(sid, ())):
+                self.release_turn_reservation(request)
+        return found
+
+    @_trace_operation
+    def continue_release_sessions(self, session_ids: list[str], max_items: int = 64) -> dict:
+        """One bounded actor task. Caller yields between invocations."""
+        if max_items < 1:
+            raise ValueError("cleanup batch must be positive")
+        deadline = time.monotonic() + 0.02
+        refs = []
+        processed = 0
+        for sid in dict.fromkeys(session_ids):
+            job = self.cleanup_jobs.get(sid)
+            if job is None:
+                continue
+            records = self.turn_traces.get(sid, {})
+            stack = job["stack"]
+            owned = self.session_segments.get(sid, [])
+            while processed < max_items and time.monotonic() < deadline:
+                if records:
+                    name, record = records.popitem()
+                    if not name.startswith("key:"):
+                        if record["routed_experts"] is not None:
+                            refs.append(record["routed_experts"])
+                        self._routing_bytes -= record.get("routing_bytes", 0)
+                        self._request_count -= 1
+                        record["routed_experts"] = None
+                    # Reverse insertion order drops descendants before parents.
+                    # Parent chains remain anchored by their own earlier records.
+                    del record
+                elif stack:
+                    node = stack[-1]
+                    if node.children:
+                        _, child = node.children.popitem()
+                        child.parent = None
+                        stack.append(child)
+                    else:
+                        if node.value is not None:
+                            _free_ray_refs(node.value)
+                            node.value = None
+                        node.parent = None
+                        stack.pop()
+                elif owned:
+                    seg = owned.pop()
+                    self._segment_count -= 1
+                    self._token_count -= len(seg.token_ids)
+                    del seg
+                else:
+                    self.sessions.pop(sid, None)
+                    self.turn_traces.pop(sid, None)
+                    self.session_segments.pop(sid, None)
+                    self.session_epochs.pop(sid, None)
+                    self.smoke_held_sessions.discard(sid)
+                    self.turn_owners.pop(sid, None)
+                    self.cleanup_jobs.pop(sid, None)
                     break
-        return prefix, nodes
+                processed += 1
+            if processed >= max_items or time.monotonic() >= deadline:
+                break
+        if refs:
+            ray.internal.free(refs, local_only=False)
+        return {"pending": [sid for sid in session_ids if sid in self.cleanup_jobs], "processed": processed}
 
     def release(self, session_id: str, key: str | None = None):
-        """Release Trie nodes and free associated resources for a session.
-
-        Args:
-            session_id (str): The session identifier.
-            key (str | None): If None, release the whole session Trie and drop the session. Otherwise release only
-                the node at ``key`` (used by the SessionServer to drop an orphaned placeholder), keeping the session.
-        """
+        if key is not None:
+            self.get_or_create(session_id).release(key)
+            return
         assert session_id in self.sessions, f"Session ID '{session_id}' not found for release."
-        trie = self.sessions.pop(session_id) if key is None else self.sessions[session_id]
-        trie.release(key)
-        if key is None:
-            records = self.turn_traces.pop(session_id, {})
-            self.smoke_held_sessions.discard(session_id)
-            refs = [record["routed_experts"] for name, record in records.items()
-                    if not name.startswith("key:") and record["routed_experts"] is not None]
-            if refs:
-                ray.internal.free(refs, local_only=False)
+        self.release_sessions([session_id])
 
     def release_sessions(self, session_ids: list[str]) -> list[str]:
-        """Release existing trace sessions in one actor call.
-
-        Args:
-            session_ids (list[str]): Session identifiers that no longer own live rollout state.
-
-        Returns:
-            list[str]: Session identifiers that existed and were released.
-        """
-        released_session_ids = []
-        for session_id in dict.fromkeys(session_ids):
-            if session_id not in self.sessions:
-                continue
-            self.release(session_id)
-            released_session_ids.append(session_id)
-        return released_session_ids
+        """Synchronous compatibility API; async consumers use bounded RPCs."""
+        found = self.begin_release_sessions(session_ids)
+        pending = found
+        while pending:
+            pending = self.continue_release_sessions(pending)["pending"]
+        return found
 
     def release_all(self):
         """Release all sessions and free associated resources."""
@@ -520,6 +738,7 @@ class RolloutTraceStore:
         self.objects.clear()
         self.updated_at.clear()
 
+    @_trace_operation
     def export_training_trace(self, session_id: str, prompt_text: str, request_id: str | None = None) -> dict:
         """Export the stored training trace given a complete prompt text.
 
@@ -536,6 +755,8 @@ class RolloutTraceStore:
         Raises:
             ValueError: If the prompt_text does not completely match the trace keys in the session.
         """
+        if session_id in self.closed_sessions:
+            raise ValueError("session closed")
         turns = self.turn_traces.get(session_id)
         if turns is not None:
             record = turns.get(request_id if request_id is not None else "key:" + prompt_text)
@@ -546,7 +767,7 @@ class RolloutTraceStore:
             if record.get("routing_released"):
                 raise ValueError("routing for this unselected terminal endpoint was released")
             trace = {"input_ids": [], "labels": [], "logprobs": [], "model_steps": [], "policy_versions": []}
-            for segment in record["segments"]:
+            for segment in path_segments(record["path"]):
                 trace["input_ids"].extend(segment.token_ids)
                 trace["labels"].extend(segment.labels)
                 trace["logprobs"].extend(segment.logprobs)
@@ -623,9 +844,16 @@ def get_store():
     global _handle_cache
     if _handle_cache is not None:
         return _handle_cache
+    from .trace_shards import shard_count, acquire_shards
+    if shard_count() > 1:
+        _handle_cache = acquire_shards(RolloutTraceStore, _STORE_NAME, _STORE_NAMESPACE, create=True)
+        return _handle_cache
 
     try:
         _handle_cache = ray.get_actor(_STORE_NAME, namespace=_STORE_NAMESPACE)
+        if ray.get(_handle_cache.trace_topology.remote())[0] != 1:
+            _handle_cache = None
+            raise RuntimeError("single-shard client found a sharded trace run")
         return _handle_cache
     except ValueError:
         pass
@@ -663,9 +891,16 @@ def get_existing_store():
         return None
     if _handle_cache is not None:
         return _handle_cache
+    from .trace_shards import shard_count, acquire_shards
+    if shard_count() > 1:
+        _handle_cache = acquire_shards(RolloutTraceStore, _STORE_NAME, _STORE_NAMESPACE, create=False)
+        return _handle_cache
 
     try:
         _handle_cache = ray.get_actor(_STORE_NAME, namespace=_STORE_NAMESPACE)
+        if ray.get(_handle_cache.trace_topology.remote())[0] != 1:
+            _handle_cache = None
+            raise RuntimeError("single-shard client found a sharded trace run")
     except ValueError:
         return None
     return _handle_cache
@@ -688,7 +923,12 @@ async def release_existing_sessions(session_ids: list[str]) -> set[str]:
     if store is None:
         return set()
 
-    return set(await store.release_sessions.remote(session_ids))
+    found = await store.begin_release_sessions.remote(session_ids)
+    pending = found
+    while pending:
+        pending = (await store.continue_release_sessions.remote(pending))["pending"]
+        await asyncio.sleep(0)
+    return set(found)
 
 
 async def release_and_discard_rollout_groups(groups: list[list[RolloutState]]) -> None:

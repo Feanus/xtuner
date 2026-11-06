@@ -1001,7 +1001,10 @@ class BaseRLTrainer:
         if store is None:
             return set()
 
-        released_session_ids = ray.get(store.release_sessions.remote(session_ids))
+        released_session_ids = ray.get(store.begin_release_sessions.remote(session_ids))
+        pending = released_session_ids
+        while pending:
+            pending = ray.get(store.continue_release_sessions.remote(pending))["pending"]
         self.logger.info(
             "Release owned trace sessions and preserve sessions held by other consumers: "
             f"released={len(released_session_ids)}, requested={len(session_ids)}"

@@ -84,7 +84,8 @@ class TestRolloutTraceStore(unittest.TestCase):
 
     def test_release_existing_sessions_stably_deduplicates_before_rpc(self):
         release_remote = AsyncMock(return_value=["one"])
-        store = SimpleNamespace(release_sessions=SimpleNamespace(remote=release_remote))
+        store = SimpleNamespace(begin_release_sessions=SimpleNamespace(remote=release_remote),
+                                continue_release_sessions=SimpleNamespace(remote=AsyncMock(return_value={"pending": []})))
         with patch(
             "xtuner.v1.rl.rollout.trace_store.get_existing_store",
             return_value=store,

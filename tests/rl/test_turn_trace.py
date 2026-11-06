@@ -66,7 +66,9 @@ def test_release_frees_each_request_route_once_and_preserves_other_session():
     store.insert("other", "X", segment("X"))
     with patch("ray.internal.free") as free:
         assert store.release_sessions(["s", "s"]) == ["s"]
-    free.assert_called_once_with([r0, r1], local_only=False)
+    assert len(free.call_args_list) == 1
+    assert set(free.call_args.args[0]) == {r0, r1}
+    assert free.call_args.kwargs == {"local_only": False}
     assert store.list_sessions() == ["other"]
     assert store.turn_memory()["routing_bytes"] == 0
 
@@ -111,7 +113,9 @@ def test_terminal_route_pruning_keeps_both_branches_and_original_probabilities()
         store.export_training_trace("s", "PA", "t0")
     with patch("ray.internal.free") as free:
         store.release_sessions(["s"])
-        free.assert_called_once_with([left, right], local_only=False)
+        assert len(free.call_args_list) == 1
+        assert set(free.call_args.args[0]) == {left, right}
+        assert free.call_args.kwargs == {"local_only": False}
 
 
 def test_cross_replica_session_owner_and_cancellation():

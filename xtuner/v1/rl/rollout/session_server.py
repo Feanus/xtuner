@@ -419,18 +419,26 @@ class SessionServer:
         #    must never keep. ``delta_ids`` is only needed locally to build
         #    ``input_ids``; ``on_response`` re-derives and persists the delta node
         #    once its routed experts are known (single-phase write).
-        prefix, nodes = await self.store.search.remote(session_id, prompt_text, filter_none=True)
-        if prefix:
-            get_logger().debug(f"Hit prefix cache for session {session_id}")
-        delta = prompt_text[len(prefix) :]
-        delta_ids = self.tokenizer.encode(delta, add_special_tokens=False) if delta else []
-        input_ids = reduce(add, [node.value.token_ids for node in nodes] + [delta_ids])
         context = _turn_context.get()
         if context is not None:
-            context.update(prompt_key=prompt_text, prefix_segments=[n.value for n in nodes],
+            prepared_at = time.perf_counter()
+            prepared = await self.store.prepare_turn.remote(session_id, prompt_text, context["ticket"].request_id)
+            if os.environ.get("CYBERGYM_TRACE_METRICS", "0") == "1":
+                _turn_event("trace_prepare_rpc", context["ticket"], seconds=time.perf_counter() - prepared_at)
+            prefix, prefix_ids = prepared["prefix"], prepared["input_ids"]
+        else:
+            prefix, nodes = await self.store.search.remote(session_id, prompt_text, filter_none=True)
+            prefix_ids = [token for node in nodes for token in node.value.token_ids]
+        if prefix:
+            get_logger().debug(f"Hit prefix cache for session {session_id}")
+        delta = prompt_text[len(prefix):]
+        delta_ids = self.tokenizer.encode(delta, add_special_tokens=False) if delta else []
+        input_ids = prefix_ids + delta_ids
+        if context is not None:
+            context.update(prompt_key=prompt_text, prefix_handle=prepared["handle"],
                            delta_ids=delta_ids, delta_text=delta, input_ids=input_ids)
             await self.store.reserve_turn.remote(context["ticket"].request_id,
-                int(os.environ.get("CYBERGYM_ROUTE_RESERVATION_BYTES", str(1024**3))))
+                int(os.environ.get("CYBERGYM_ROUTE_RESERVATION_BYTES", str(1024**3))), session_id=session_id)
 
         # 3. Inject extension fields on the forwarded request. The body still
         #    follows ``fmt``'s native schema. ``logprobs``/``top_logprobs`` are
@@ -535,7 +543,10 @@ class SessionServer:
             full_experts = None
             routing_bytes = 0
             if raw_routed_expert is not None:
+                decode_at = time.perf_counter()
                 experts = await self._decode_routed_experts(raw_routed_expert)
+                if os.environ.get("CYBERGYM_TRACE_METRICS", "0") == "1":
+                    _turn_event("trace_decode_rpc", ticket, seconds=time.perf_counter() - decode_at)
                 expected = len(context["input_ids"]) + len(output_token_ids) - 1
                 if len(experts) != expected:
                     raise ValueError(f"full turn routing rows {len(experts)} != {expected}")
@@ -552,9 +563,10 @@ class SessionServer:
                                         model_step=ticket.source_optimizer_step, policy_version=ticket.version,
                                         request_id=ticket.request_id)
             ticket.phase = "committing"
+            commit_at = time.perf_counter()
             try:
                 await self.store.commit_turn.remote(
-                    session_id, old_prompt, new_prompt, context["prefix_segments"], delta, response,
+                    session_id, old_prompt, new_prompt, context["prefix_handle"], delta, response,
                     [full_experts], {"request_id": ticket.request_id, "version": ticket.version,
                                    "source_optimizer_step": ticket.source_optimizer_step,
                                    "routing_bytes": routing_bytes},
@@ -563,6 +575,8 @@ class SessionServer:
                 if full_experts is not None:
                     ray.internal.free([full_experts], local_only=False)
                 raise
+            if os.environ.get("CYBERGYM_TRACE_METRICS", "0") == "1":
+                _turn_event("trace_commit_rpc", ticket, seconds=time.perf_counter() - commit_at)
             ticket.trace_committed = True
             _turn_event("trace_committed", ticket, prompt_tokens=len(context["input_ids"]),
                         generated_tokens=len(output_token_ids), routing_bytes=routing_bytes)
@@ -743,7 +757,7 @@ class SessionServer:
                     watcher.cancel()
                     await asyncio.gather(watcher, return_exceptions=True)
                     _turn_context.reset(token)
-                    await self.store.release_turn_reservation.remote(ticket.request_id)
+                    await self.store.release_turn_reservation.remote(ticket.request_id, session_id=session_id)
                     _turn_event("finished", ticket, trace_committed=ticket.trace_committed,
                                 cancel_reason=ticket.cancel_reason)
         except TurnCancelled as exc:
