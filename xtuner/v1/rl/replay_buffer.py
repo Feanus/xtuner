@@ -641,6 +641,53 @@ class ReplayBuffer:
                 consumed_counts[task_name] = len(task_batch)
         return batch_by_task, consumed_counts
 
+    async def completed_fifo_snapshot(self, task_names: list[str], prefix_size: int) -> tuple[int, dict[str, int]]:
+        """Raw completed FIFO prefix, independent of the configured replay policy.
+
+        Adaptive admission uses this bounded batch window. Stale queued groups
+        remain represented until the manager refreshes their native lifecycle.
+        """
+        async with self._lock:
+            records = await self._storage.get(
+                {
+                    "$and": [
+                        {"task_name": {"$in": task_names}},
+                        {"status": Status.COMPLETED},
+                    ]
+                }
+            )
+            records.sort(key=lambda record: record.timestamp_id)
+            counts = dict.fromkeys(task_names, 0)
+            for record in records[:prefix_size]:
+                counts[record.task_name] += 1
+            return len(records), counts
+
+    async def take_completed_fifo(
+        self,
+        task_names: list[str],
+        batch_size: int,
+    ) -> list[tuple[str, list[RolloutState]]]:
+        """Atomically take a full cross-task FIFO batch, or leave it untouched.
+
+        No partial batch is reserved outside this lock, so selected-partial plus
+        the next fitting FIFO prefix is exactly the next ``batch_size`` records.
+        """
+        async with self._lock:
+            records = await self._storage.get(
+                {
+                    "$and": [
+                        {"task_name": {"$in": task_names}},
+                        {"status": Status.COMPLETED},
+                    ]
+                }
+            )
+            records.sort(key=lambda record: record.timestamp_id)
+            if len(records) < batch_size:
+                return []
+            records = records[:batch_size]
+            await self._storage.delete([record.uid for record in records])
+            return [(record.task_name, record.item) for record in records]
+
     async def count_statuses(
         self,
         task_names: list[str],

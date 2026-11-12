@@ -17,6 +17,7 @@ from xtuner.v1.rl.replay_buffer import ReplayBuffer
 from xtuner.v1.rl.rollout import RolloutController
 from xtuner.v1.utils import get_logger
 
+from .adaptive_producer import AdaptiveDomainProducer
 from .disagg_producer import (
     DisaggAsyncProduceStrategyConfig,
     DisaggProduceContext,
@@ -24,6 +25,7 @@ from .disagg_producer import (
     DisaggProduceStrategy,
     DisaggProduceStrategyConfig,
 )
+from .domain_scheduler import AdaptiveDomainSchedulerConfig, FixedDomainSchedulerConfig
 from .produce_utils import (
     _LEFTOVER_STATUSES,
     _MANAGER_STATE_PATH,
@@ -37,6 +39,7 @@ from .produce_utils import (
     get_pending_task_counts,
     manager_state_path,
     refresh_for_all_tasks,
+    take_adaptive_train_batch,
     take_train_batch,
     task_checkpoint_path,
 )
@@ -67,6 +70,10 @@ class DisaggAgentLoopManagerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     tasks: list[DisaggTaskSpecConfig] | DisaggTaskSpecConfig
+    domain_scheduler: FixedDomainSchedulerConfig | AdaptiveDomainSchedulerConfig = Field(
+        default_factory=FixedDomainSchedulerConfig,
+        discriminator="kind",
+    )
 
     def build(
         self,
@@ -116,6 +123,7 @@ class DisaggAgentLoopManagerConfig(BaseModel):
             replay_buffer=replay_buffer,
             rollout_controller=rollout_controller,
             logger=logger,
+            domain_scheduler=self.domain_scheduler,
         )
 
 
@@ -174,10 +182,14 @@ class DisaggAgentLoopManager:
         replay_buffer: ReplayBuffer,
         rollout_controller: RolloutController,
         logger=None,
+        domain_scheduler: FixedDomainSchedulerConfig | AdaptiveDomainSchedulerConfig | None = None,
     ):
         if not task_runners:
             raise ValueError("DisaggAgentLoopManager requires at least one task runner.")
-        if sum(task.weight for task in task_runners) <= 0:
+        if (
+            not isinstance(domain_scheduler, AdaptiveDomainSchedulerConfig)
+            and sum(task.weight for task in task_runners) <= 0
+        ):
             raise ValueError("At least one task weight must be positive for DisaggAgentLoopManager.")
 
         self.task_runners = task_runners
@@ -191,6 +203,11 @@ class DisaggAgentLoopManager:
         self.name = task_runners[0].task_name if len(task_runners) == 1 else "multi_task"
         self.logger = get_logger() if logger is None else logger
         self.task_names = [task.task_name for task in task_runners]
+        self._adaptive = (
+            AdaptiveDomainProducer(domain_scheduler, task_runners, replay_buffer)
+            if isinstance(domain_scheduler, AdaptiveDomainSchedulerConfig)
+            else None
+        )
 
         # consumer 同步权重前置位；producer / strategy 直接观察 event。
         self._update_event = asyncio.Event()
@@ -207,6 +224,7 @@ class DisaggAgentLoopManager:
 
         # producer / consumer 共享绝对进度；对象引用保持稳定。
         self._produce_progress = DisaggProduceProgress.build(self.task_names)
+        self._adaptive_producer_error: BaseException | None = None
 
     def _consume_pause_time(self) -> float:
         pause_time_s = self._pause_time_s
@@ -265,6 +283,9 @@ class DisaggAgentLoopManager:
         self._status = AgentLoopManagerStatus.UPDATE_WEIGHT_AND_ABORT
         self._update_event.set()
         await self._rollout_controller.pause_generation.remote()  # type: ignore[attr-defined]
+        if self._adaptive is not None:
+            self._pause_time_s = await self._adaptive.pause(self._adaptive_context)
+            return self._pause_time_s
 
         pause_time_s = 0.0
         for task in self.task_runners:
@@ -293,6 +314,8 @@ class DisaggAgentLoopManager:
         await self._rollout_controller.continue_generation.remote()  # type: ignore[attr-defined]
         self._status = AgentLoopManagerStatus.NORMAL
         self._update_event.clear()
+        if self._adaptive is not None:
+            self._adaptive.continue_produce()
 
     def shutdown(self) -> None:
         self._status = AgentLoopManagerStatus.FINISH
@@ -305,6 +328,9 @@ class DisaggAgentLoopManager:
 
     async def produce_loop(self, batch_size: int) -> None:
         # 后台持续生产；前台通过 get_batch 消费。
+        if self._adaptive is not None:
+            await self._adaptive_produce_loop(batch_size)
+            return
         while not self._finish_event.is_set():
             if self._status == AgentLoopManagerStatus.FINISH:
                 break
@@ -336,6 +362,8 @@ class DisaggAgentLoopManager:
 
     async def get_batch(self, batch_size: int, train_step: int) -> ProduceBatchResult:
         # 非共卡消费入口；空 batch 只表示已过期且已有更新模型可同步。
+        if self._adaptive is not None:
+            return await self._get_adaptive_batch(batch_size, train_step)
         progress = self._produce_progress
         progress.begin_consume(train_step)
         await refresh_for_all_tasks(
@@ -404,6 +432,122 @@ class DisaggAgentLoopManager:
 
         return ProduceBatchResult(rollout_states=[])
 
+    def get_scheduler_metrics(self) -> dict[str, float]:
+        """Current process estimates and capacity gauges (empty in fixed mode)."""
+        return self._adaptive.metrics() if self._adaptive is not None else {}
+
+    def _adaptive_context(self, task_name: str) -> DisaggProduceContext:
+        task = next(task for task in self.task_runners if task.task_name == task_name)
+        return DisaggProduceContext(
+            agent_loop=task.agent_loop,
+            sampler=task.sampler,
+            replay_buffer=self.replay_buffer,
+            task_batch_size=self._adaptive.config.target_groups[task_name],
+            task_name=task_name,
+            train_step=self._produce_progress.producer_future_step,
+            model_step=self._model_step,
+            progress=self._produce_progress,
+            update_event=self._update_event,
+            stale_threshold=task.stale_threshold,
+            token_stale_threshold=task.token_stale_threshold,
+            expired_groups_retryable=task.expired_groups_retryable,
+        )
+
+    async def _adaptive_produce_loop(self, batch_size: int) -> None:
+        adaptive = self._adaptive
+        assert adaptive is not None
+        adaptive.validate_batch_size(batch_size)
+        try:
+            while not self._finish_event.is_set():
+                # Completion collection continues when admissions are stopped,
+                # globally paced, domain-capped, or FIFO-backpressured.
+                await adaptive.collect()
+                admitted = False
+                if self._status == AgentLoopManagerStatus.NORMAL:
+                    count, _ = await self.replay_buffer.completed_fifo_snapshot(self.task_names, batch_size)
+                    progress = self._produce_progress
+                    base_step = max(progress.producer_future_step, progress.next_consumer_step)
+                    # A large completion wave must not jump over a native
+                    # model-expiry boundary before checking it.
+                    progress.producer_future_step = min(
+                        base_step + 1,
+                        max(base_step, progress.next_consumer_step + count // batch_size),
+                    )
+                    if any(
+                        task.produce_strategy.is_model_expired(progress.producer_future_step, self._model_step)
+                        for task in self.task_runners
+                    ):
+                        self._status = AgentLoopManagerStatus.EXPIRED_BATCH
+                    else:
+                        admitted = await adaptive.admit_one(
+                            self._adaptive_context,
+                            lambda: self._update_event.is_set() or self._finish_event.is_set(),
+                        )
+                if not admitted:
+                    await adaptive.wait_for_change()
+                else:
+                    await asyncio.sleep(0)
+        except BaseException as error:
+            self._adaptive_producer_error = error
+            raise
+        finally:
+            await adaptive.cancel_pending()
+
+    async def _get_adaptive_batch(self, batch_size: int, train_step: int) -> ProduceBatchResult:
+        adaptive = self._adaptive
+        assert adaptive is not None
+        adaptive.validate_batch_size(batch_size)
+        progress = self._produce_progress
+        progress.begin_consume(train_step)
+        await refresh_for_all_tasks(
+            task_runners=self.task_runners,
+            replay_buffer=self.replay_buffer,
+            logger=self.logger,
+            manager_name=self.name,
+            train_step=train_step,
+            statuses=[Status.COMPLETED, Status.ABORTED, Status.EXPIRED],
+        )
+        while not self._finish_event.is_set():
+            if self._adaptive_producer_error is not None:
+                raise self._adaptive_producer_error
+            expired = self._status == AgentLoopManagerStatus.EXPIRED_BATCH
+            if expired and train_step - 1 > self._model_step:
+                result = ProduceBatchResult(rollout_states=[], status=ProduceBatchStatus.EXPIRED_BATCH)
+                result.group_gen_pause_time_s = self._consume_pause_time() or None
+                return result
+            result = await take_adaptive_train_batch(
+                task_runners=self.task_runners,
+                replay_buffer=self.replay_buffer,
+                logger=self.logger,
+                manager_name=self.name,
+                progress=progress,
+                batch_size=batch_size,
+                current_train_step=train_step,
+            )
+            if result.rollout_states:
+                result.group_gen_pause_time_s = self._consume_pause_time() or None
+                if expired:
+                    result.status = ProduceBatchStatus.EXPIRED_BATCH
+                progress.finish_consume(train_step)
+                result.scheduler_metrics = self.get_scheduler_metrics()
+                await refresh_for_all_tasks(
+                    task_runners=self.task_runners,
+                    replay_buffer=self.replay_buffer,
+                    logger=self.logger,
+                    manager_name=self.name,
+                    train_step=train_step + 1,
+                    statuses=[Status.COMPLETED, Status.ABORTED, Status.EXPIRED],
+                )
+                return result
+            if expired:
+                raise RuntimeError(
+                    "Adaptive domain manager reached EXPIRED_BATCH without a newer model or a ready FIFO batch: "
+                    f"train_step={train_step}, rollout_model_step={self._model_step}, "
+                    f"producer_future_step={progress.producer_future_step}."
+                )
+            await adaptive.wait_for_change()
+        return ProduceBatchResult(rollout_states=[])
+
     def _progress_state_without_replay_buffer(self, progress_state: dict) -> dict:
         progress_state = dict(progress_state)
         consumed_samples = dict(progress_state["consumed_samples"])
@@ -431,6 +575,11 @@ class DisaggAgentLoopManager:
         checkpoint_path = Path(checkpoint_path)
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         pending_task_counts = get_pending_task_counts(self.task_runners)
+        if self._adaptive is not None:
+            pending_task_counts["adaptive"] = (
+                self._adaptive.pending_task_count() + self._adaptive.buffered_result_count()
+            )
+            pending_task_counts = {name: count for name, count in pending_task_counts.items() if count}
         if pending_task_counts:
             raise RuntimeError(
                 "Cannot save AgentLoopManager while pending rollout tasks still exist: "
@@ -453,6 +602,11 @@ class DisaggAgentLoopManager:
             json.dump(
                 {
                     "status": self._status.name,
+                    **(
+                        {"adaptive_rng_state": self._adaptive.state.rng.getstate()}
+                        if self._adaptive is not None
+                        else {}
+                    ),
                     "model_step": self._model_step,
                     "replay_buffer_saved": not no_save_replay_buffer,
                     **progress_state,
@@ -469,6 +623,9 @@ class DisaggAgentLoopManager:
         state_path = manager_state_path(checkpoint_path)
         with state_path.open("r") as f:
             manager_state = json.load(f)
+        if self._adaptive is not None and manager_state.get("adaptive_rng_state") is not None:
+            rng_state = manager_state["adaptive_rng_state"]
+            self._adaptive.state.rng.setstate((rng_state[0], tuple(rng_state[1]), rng_state[2]))
         if manager_state.get("replay_buffer_saved", True):
             # replay buffer 恢复是 async I/O，不能在已有 event loop 中再次嵌套 asyncio_run。
             await self.replay_buffer.resume(checkpoint_path)

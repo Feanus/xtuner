@@ -16,6 +16,8 @@ from xtuner.v1.rl.replay_buffer import ReplayBuffer
 from xtuner.v1.rl.rollout import RolloutController
 from xtuner.v1.utils import get_logger
 
+from .adaptive_producer import AdaptiveDomainProducer
+from .domain_scheduler import AdaptiveDomainSchedulerConfig, FixedDomainSchedulerConfig
 from .produce_utils import (
     _MANAGER_STATE_PATH,
     _STATUS_POLL_INTERVAL_S,
@@ -27,6 +29,7 @@ from .produce_utils import (
     get_pending_task_counts,
     manager_state_path,
     refresh_for_all_tasks,
+    take_adaptive_train_batch,
     take_train_batch,
     task_checkpoint_path,
 )
@@ -127,6 +130,10 @@ class AgentLoopManagerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     tasks: list[TaskSpecConfig] | TaskSpecConfig
+    domain_scheduler: FixedDomainSchedulerConfig | AdaptiveDomainSchedulerConfig = Field(
+        default_factory=FixedDomainSchedulerConfig,
+        discriminator="kind",
+    )
 
     def build(
         self,
@@ -176,6 +183,7 @@ class AgentLoopManagerConfig(BaseModel):
             replay_buffer=replay_buffer,
             rollout_controller=rollout_controller,
             logger=logger,
+            domain_scheduler=self.domain_scheduler,
         )
 
 
@@ -197,10 +205,14 @@ class AgentLoopManager:
         replay_buffer: ReplayBuffer,
         rollout_controller: RolloutController,
         logger=None,
+        domain_scheduler: FixedDomainSchedulerConfig | AdaptiveDomainSchedulerConfig | None = None,
     ):
         if not task_runners:
             raise ValueError("AgentLoopManager requires at least one task runner.")
-        if sum(task.weight for task in task_runners) <= 0:
+        if (
+            not isinstance(domain_scheduler, AdaptiveDomainSchedulerConfig)
+            and sum(task.weight for task in task_runners) <= 0
+        ):
             raise ValueError("At least one task weight must be positive for AgentLoopManager.")
 
         self.task_runners = task_runners
@@ -214,6 +226,11 @@ class AgentLoopManager:
         self.name = task_runners[0].task_name if len(task_runners) == 1 else "multi_task"
         self.logger = get_logger() if logger is None else logger
         self.task_names = [task.task_name for task in task_runners]
+        self._adaptive = (
+            AdaptiveDomainProducer(domain_scheduler, task_runners, replay_buffer)
+            if isinstance(domain_scheduler, AdaptiveDomainSchedulerConfig)
+            else None
+        )
 
     async def produce_batch(
         self,
@@ -223,6 +240,8 @@ class AgentLoopManager:
         model_step: int,
     ) -> ProduceBatchResult:
         # 共卡同步入口：生产入 buffer -> pause/drain 本轮 pending -> 取非空训练 batch。
+        if self._adaptive is not None:
+            return await self._produce_adaptive_batch(batch_size, train_step, model_step=model_step)
         if batch_size <= 0:
             raise ValueError(f"produce_batch expects batch_size > 0, got {batch_size}")
         start = time.perf_counter()
@@ -313,6 +332,76 @@ class AgentLoopManager:
         )
         return result
 
+    def get_scheduler_metrics(self) -> dict[str, float]:
+        """Current process estimates and capacity gauges (empty in fixed mode)."""
+        return self._adaptive.metrics() if self._adaptive is not None else {}
+
+    async def _produce_adaptive_batch(
+        self, batch_size: int, train_step: int, *, model_step: int
+    ) -> ProduceBatchResult:
+        adaptive = self._adaptive
+        assert adaptive is not None
+        adaptive.validate_batch_size(batch_size)
+        progress = ProduceProgress.build(task_names=self.task_names, target_samples=adaptive.config.target_groups)
+        tasks = {task.task_name: task for task in self.task_runners}
+
+        def context_for(name):
+            task = tasks[name]
+            return ProduceContext(
+                agent_loop=task.agent_loop,
+                sampler=task.sampler,
+                replay_buffer=self.replay_buffer,
+                task_batch_size=adaptive.config.target_groups[name],
+                task_name=name,
+                train_step=train_step,
+                model_step=model_step,
+                progress=progress,
+                stale_threshold=task.stale_threshold,
+                token_stale_threshold=task.token_stale_threshold,
+                expired_groups_retryable=task.expired_groups_retryable,
+            )
+
+        await refresh_for_all_tasks(
+            task_runners=self.task_runners,
+            replay_buffer=self.replay_buffer,
+            logger=self.logger,
+            manager_name=self.name,
+            train_step=train_step,
+            statuses=[Status.COMPLETED, Status.ABORTED, Status.EXPIRED],
+        )
+        await self._rollout_controller.continue_generation.remote()  # type: ignore[attr-defined]
+        adaptive.continue_produce()
+        started = time.perf_counter()
+        try:
+            while True:
+                await adaptive.collect()
+                count, _ = await self.replay_buffer.completed_fifo_snapshot(self.task_names, batch_size)
+                if count >= batch_size:
+                    break
+                if not await adaptive.admit_one(context_for, lambda: False):
+                    await adaptive.wait_for_change()
+                else:
+                    await asyncio.sleep(0)
+        except BaseException:
+            await adaptive.cancel_pending()
+            raise
+        finally:
+            await self._rollout_controller.pause_generation.remote()  # type: ignore[attr-defined]
+        pause_time = await adaptive.pause(context_for)
+        progress.add_produce_time(time.perf_counter() - started)
+        result = await take_adaptive_train_batch(
+            task_runners=self.task_runners,
+            replay_buffer=self.replay_buffer,
+            logger=self.logger,
+            manager_name=self.name,
+            progress=progress,
+            batch_size=batch_size,
+            current_train_step=train_step,
+            pause_time_s=pause_time,
+        )
+        result.scheduler_metrics = self.get_scheduler_metrics()
+        return result
+
     async def save(
         self,
         checkpoint_path: Path | str,
@@ -324,6 +413,11 @@ class AgentLoopManager:
         checkpoint_path = Path(checkpoint_path)
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         pending_task_counts = get_pending_task_counts(self.task_runners)
+        if self._adaptive is not None:
+            pending_task_counts["adaptive"] = (
+                self._adaptive.pending_task_count() + self._adaptive.buffered_result_count()
+            )
+            pending_task_counts = {name: count for name, count in pending_task_counts.items() if count}
         if pending_task_counts:
             raise RuntimeError(
                 "Cannot save AgentLoopManager while pending rollout tasks still exist: "
@@ -343,6 +437,11 @@ class AgentLoopManager:
             json.dump(
                 {
                     "model_step": model_step,
+                    **(
+                        {"adaptive_rng_state": self._adaptive.state.rng.getstate()}
+                        if self._adaptive is not None
+                        else {}
+                    ),
                     "replay_buffer_saved": not no_save_replay_buffer,
                 },
                 f,
@@ -357,6 +456,9 @@ class AgentLoopManager:
         state_path = manager_state_path(checkpoint_path)
         with state_path.open("r") as f:
             manager_state = json.load(f)
+        if self._adaptive is not None and manager_state.get("adaptive_rng_state") is not None:
+            rng_state = manager_state["adaptive_rng_state"]
+            self._adaptive.state.rng.setstate((rng_state[0], tuple(rng_state[1]), rng_state[2]))
         if manager_state.get("replay_buffer_saved", True):
             # replay buffer 恢复是 async I/O，不能在已有 event loop 中再次嵌套 asyncio_run。
             await self.replay_buffer.resume(checkpoint_path)

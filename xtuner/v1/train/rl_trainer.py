@@ -1502,6 +1502,8 @@ class BaseRLTrainer:
         all_scalars["async/expired_samples"] = produce_result.leftover_expired
         all_scalars["async/failed_samples"] = produce_result.failed_samples
         all_scalars["async/filtered_samples"] = produce_result.filtered_samples
+        if produce_result.scheduler_metrics is not None:
+            all_scalars.update(produce_result.scheduler_metrics)
 
         if train_info:
             data_info = train_info.get("data_info", {})

@@ -246,6 +246,7 @@ class ProduceBatchResult:
     produce_time_s: float = 0.0
     task_batch_sizes: dict[str, int] | None = None
     task_results: dict[str, ProduceBatchResult] | None = None
+    scheduler_metrics: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -622,6 +623,55 @@ async def take_train_batch(
         progress=progress,
         pause_time_s=pause_time_s,
     )
+
+
+async def take_adaptive_train_batch(
+    *,
+    task_runners: list[_TaskRunner],
+    replay_buffer: ReplayBuffer,
+    logger,
+    manager_name: str,
+    progress: ProduceProgress | DisaggProduceProgress,
+    batch_size: int,
+    current_train_step: int,
+    pause_time_s: float = 0.0,
+) -> ProduceBatchResult:
+    """Take one atomic cross-domain FIFO batch without per-task quotas."""
+    task_names = [task.task_name for task in task_runners]
+    ordered = await replay_buffer.take_completed_fifo(task_names, batch_size)
+    if not ordered:
+        return ProduceBatchResult(rollout_states=[])
+    batch_by_task: dict[str, list[list[RolloutState]]] = {name: [] for name in task_names}
+    for name, group in ordered:
+        batch_by_task[name].append(group)
+    for task in task_runners:
+        if task.token_stale_threshold is None:
+            continue
+        for group in batch_by_task[task.task_name]:
+            masks = calculate_group_effective_response_masks(
+                group,
+                current_train_step=current_train_step,
+                token_stale_threshold=task.token_stale_threshold,
+            )
+            for state, mask in zip(group, masks):
+                if mask is not None:
+                    state.response_mask = mask
+    consumed = {name: len(groups) for name, groups in batch_by_task.items()}
+    if hasattr(progress, "mark_consumed"):
+        progress.mark_consumed(consumed)
+    leftovers = await replay_buffer.count_statuses(task_names, _LEFTOVER_STATUSES)
+    result = build_produce_batch_result(
+        task_runners=task_runners,
+        task_batch_sizes=consumed,
+        batch_by_task=batch_by_task,
+        leftover_counts=leftovers,
+        progress=progress,
+        pause_time_s=pause_time_s,
+    )
+    # Aggregation groups metrics by task; the learner receives global FIFO order.
+    result.rollout_states = [group for _, group in ordered]
+    result.task_batch_sizes = consumed
+    return result
 
 
 def task_checkpoint_path(checkpoint_path: Path | str, task_name: str) -> Path:

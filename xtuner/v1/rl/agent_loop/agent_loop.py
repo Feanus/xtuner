@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, TypeAlias, cast, overload
@@ -36,6 +37,26 @@ AGENT_LOOP_CONCURRENCY_GROUP_GENERATE = "generate"
 IsValidSampleFn: TypeAlias = Callable[[list[RolloutState]], bool]
 
 
+def _has_trainable_output(state: RolloutState) -> bool:
+    """Native training-shape checks plus at least one loss-bearing token."""
+    if state.input_ids is not None:
+        return (
+            len(state.input_ids) > 1
+            and state.labels is not None
+            and len(state.labels) == len(state.input_ids)
+            and any(label != -100 for label in state.labels[1:])
+            and (state.logprobs is None or len(state.logprobs) == len(state.input_ids))
+        )
+    return (
+        bool(state.response)
+        and bool(state.response_ids)
+        and (
+            state.response_mask is None
+            or (len(state.response_mask) == len(state.response_ids) and any(state.response_mask))
+        )
+    )
+
+
 def maybe_filter_invalid_sample(
     group: list[RolloutState],
     is_valid_sample_fn: IsValidSampleFn | None,
@@ -48,7 +69,40 @@ def maybe_filter_invalid_sample(
     """
     if get_group_status(group) != Status.COMPLETED:
         return group
-    if is_valid_sample_fn is None or is_valid_sample_fn(group):
+    # Only the opt-in scheduler requests this provenance. Keep legacy filtering
+    # behavior unchanged for groups without scheduler metadata.
+    scheduler = group[0].extra_fields.get("_domain_scheduler") if group else None
+    if scheduler is not None:
+        usable = [state for state in group if _has_trainable_output(state)]
+        siblings = {state.extra_fields.get("_domain_scheduler", {}).get("original_sibling_id") for state in usable}
+        # The native trainer rejects a group containing any malformed training
+        # entry. Do not call the RL filter on a group it cannot consume.
+        admitted = (
+            len(usable) == len(group)
+            and None not in siblings
+            and len(siblings) >= max(1, scheduler["min_trainable_siblings"])
+        )
+        rewards_present = all(
+            state.reward is not None
+            and "score" in state.reward
+            and isinstance(state.reward["score"], (int, float))
+            and math.isfinite(state.reward["score"])
+            for state in group
+        )
+        if not admitted or not rewards_present:
+            for state in group:
+                state.status = Status.FAILED
+                state.extra_fields["_domain_scheduler"]["rejection"] = (
+                    "admission" if not admitted else "missing_reward"
+                )
+            return group
+    if is_valid_sample_fn is None:
+        return group
+    passed = bool(is_valid_sample_fn(group))
+    if scheduler is not None:
+        for state in group:
+            state.extra_fields["_domain_scheduler"]["filter_verdict"] = passed
+    if passed:
         return group
 
     for state in group:
